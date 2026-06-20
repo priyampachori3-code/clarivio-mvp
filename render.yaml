@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: clarivio
+    env: docker
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: FRONTEND_ORIGINS
+        value: '*'
