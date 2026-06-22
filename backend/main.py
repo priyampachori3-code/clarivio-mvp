@@ -200,9 +200,9 @@ def generate_excel_report(result: dict) -> bytes:
 async def run_reconciliation(gstr2b_file: UploadFile = File(...), tally_file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
     try:
         gstr2b_bytes = await gstr2b_file.read()
-tally_bytes = await tally_file.read()
-portal_df = parse_gstr2b(gstr2b_bytes, gstr2b_file.filename)
-tally_df = parse_tally(tally_bytes, tally_file.filename)
+        tally_bytes = await tally_file.read()
+        portal_df = parse_gstr2b(gstr2b_bytes, gstr2b_file.filename)
+        tally_df = parse_tally(tally_bytes, tally_file.filename)
         return reconcile(portal_df, tally_df)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -210,11 +210,15 @@ tally_df = parse_tally(tally_bytes, tally_file.filename)
 @app.post('/reconcile/download')
 async def download_report(gstr2b_file: UploadFile = File(...), tally_file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
     try:
-        result = reconcile(parse_gstr2b(await gstr2b_file.read()), parse_tally_excel(await tally_file.read()))
+        gstr2b_bytes = await gstr2b_file.read()
+        tally_bytes = await tally_file.read()
+        result = reconcile(
+            parse_gstr2b(gstr2b_bytes, gstr2b_file.filename),
+            parse_tally(tally_bytes, tally_file.filename),
+        )
         return Response(content=generate_excel_report(result), media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', headers={'Content-Disposition': 'attachment; filename=clarivio_reconciliation.xlsx'})
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-
 @app.get('/api/health')
 def health():
     return {'status': 'Clarivio API running'}
