@@ -1,0 +1,228 @@
+"""
+parsers.py — Clarivio format normalization layer
+Supports:
+  GSTR-2B : .json | .xlsx | .csv
+  Tally   : .xlsx | .xls | .csv
+All parsers return the same standard DataFrame with columns:
+  gstin, invoice_no, invoice_date, taxable_value, igst, cgst, sgst
+"""
+
+import io
+import json
+
+import pandas as pd
+
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def norm(value) -> str:
+    return str(value or '').strip().upper().replace(' ', '').replace('-', '')
+
+
+def amount(value) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+STANDARD_COLS = ['gstin', 'invoice_no', 'invoice_date', 'taxable_value', 'igst', 'cgst', 'sgst']
+
+
+def _finalize(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure standard columns exist, correct types, return clean DataFrame."""
+    for col in STANDARD_COLS:
+        if col not in df.columns:
+            df[col] = '' if col in {'gstin', 'invoice_no', 'invoice_date'} else 0.0
+    df['gstin'] = df['gstin'].apply(norm)
+    df['invoice_no'] = df['invoice_no'].apply(norm)
+    df['invoice_date'] = df['invoice_date'].astype(str).str.strip()
+    for col in ['taxable_value', 'igst', 'cgst', 'sgst']:
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+    return df[STANDARD_COLS].copy()
+
+
+# ── GSTR-2B parsers ──────────────────────────────────────────────────────────
+
+def _parse_gstr2b_json(file_bytes: bytes) -> pd.DataFrame:
+    data = json.loads(file_bytes)
+    b2b = (
+        data.get('data', {}).get('docdata', {}).get('b2b')
+        or data.get('b2b', [])
+    )
+    records = []
+    for supplier in b2b:
+        gstin = supplier.get('ctin', '')
+        for inv in supplier.get('inv', []):
+            item = (inv.get('itms') or [{}])[0].get('itm_det', {})
+            records.append({
+                'gstin': norm(gstin),
+                'invoice_no': norm(inv.get('inum', '')),
+                'invoice_date': inv.get('idt', ''),
+                'taxable_value': amount(inv.get('taxval', 0)),
+                'igst': amount(inv.get('igst') or item.get('iamt', 0)),
+                'cgst': amount(inv.get('cgst') or item.get('camt', 0)),
+                'sgst': amount(inv.get('sgst') or item.get('samt', 0)),
+            })
+    return _finalize(pd.DataFrame(records))
+
+
+# Column name aliases for GSTR-2B Excel/CSV exports (GST portal format)
+_GSTR2B_ALIASES = {
+    'gstin': [
+        'gstin of supplier', 'gstin', 'supplier gstin', 'ctin',
+    ],
+    'invoice_no': [
+        'invoice number', 'invoice no', 'inv no', 'inum', 'document number',
+    ],
+    'invoice_date': [
+        'invoice date', 'inv date', 'idt', 'document date', 'date of invoice',
+    ],
+    'taxable_value': [
+        'taxable value', 'taxable amount', 'taxval', 'value of taxable supply',
+    ],
+    'igst': [
+        'integrated tax', 'igst amount', 'igst', 'iamt',
+    ],
+    'cgst': [
+        'central tax', 'cgst amount', 'cgst', 'camt',
+    ],
+    'sgst': [
+        'state/ut tax', 'sgst amount', 'sgst', 'samt', 'state tax',
+    ],
+}
+
+
+def _map_columns(df: pd.DataFrame, aliases: dict) -> pd.DataFrame:
+    """Rename columns using alias map. Case-insensitive."""
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    rename = {}
+    for target, names in aliases.items():
+        for name in names:
+            if name.lower() in df.columns and target not in rename.values():
+                rename[name.lower()] = target
+                break
+    return df.rename(columns=rename)
+
+
+def _parse_gstr2b_excel(file_bytes: bytes) -> pd.DataFrame:
+    # GST portal Excel often has junk rows at top; find the header row
+    raw = pd.read_excel(io.BytesIO(file_bytes), engine='openpyxl', header=None)
+    header_row = _find_header_row(raw, list(_GSTR2B_ALIASES.keys()) + ['gstin', 'invoice'])
+    df = pd.read_excel(io.BytesIO(file_bytes), engine='openpyxl', skiprows=header_row)
+    df = _map_columns(df, _GSTR2B_ALIASES)
+    return _finalize(df)
+
+
+def _parse_gstr2b_csv(file_bytes: bytes) -> pd.DataFrame:
+    raw = pd.read_csv(io.BytesIO(file_bytes), header=None, encoding='utf-8-sig')
+    header_row = _find_header_row(raw, ['gstin', 'invoice'])
+    df = pd.read_csv(io.BytesIO(file_bytes), skiprows=header_row, encoding='utf-8-sig')
+    df = _map_columns(df, _GSTR2B_ALIASES)
+    return _finalize(df)
+
+
+# ── Tally parsers ────────────────────────────────────────────────────────────
+
+_TALLY_ALIASES = {
+    'gstin': [
+        'gstin', 'party gstin', 'supplier gstin', 'gstin/uin',
+    ],
+    'invoice_no': [
+        'invoice no', 'invoice number', 'inv no', 'voucher no',
+        'voucher number', 'bill no', 'ref no',
+    ],
+    'invoice_date': [
+        'invoice date', 'inv date', 'date', 'voucher date', 'bill date',
+    ],
+    'taxable_value': [
+        'taxable value', 'taxable amount', 'basic amount',
+        'assessable value', 'net amount',
+    ],
+    'igst': [
+        'igst', 'igst amount', 'integrated gst',
+    ],
+    'cgst': [
+        'cgst', 'cgst amount', 'central gst',
+    ],
+    'sgst': [
+        'sgst', 'sgst amount', 'state gst', 'utgst', 'utgst amount',
+    ],
+}
+
+
+def _parse_tally_excel(file_bytes: bytes, engine: str = 'openpyxl') -> pd.DataFrame:
+    raw = pd.read_excel(io.BytesIO(file_bytes), engine=engine, header=None)
+    header_row = _find_header_row(raw, ['gstin', 'invoice', 'voucher', 'date'])
+    df = pd.read_excel(io.BytesIO(file_bytes), engine=engine, skiprows=header_row)
+    df = _map_columns(df, _TALLY_ALIASES)
+    return _finalize(df)
+
+
+def _parse_tally_csv(file_bytes: bytes) -> pd.DataFrame:
+    raw = pd.read_csv(io.BytesIO(file_bytes), header=None, encoding='utf-8-sig')
+    header_row = _find_header_row(raw, ['gstin', 'invoice', 'voucher', 'date'])
+    df = pd.read_csv(io.BytesIO(file_bytes), skiprows=header_row, encoding='utf-8-sig')
+    df = _map_columns(df, _TALLY_ALIASES)
+    return _finalize(df)
+
+
+# ── header row finder ────────────────────────────────────────────────────────
+
+def _find_header_row(raw: pd.DataFrame, keywords: list[str]) -> int:
+    """
+    Scan first 20 rows to find the row that looks like a header.
+    Returns 0 if not found (assume row 0 is the header).
+    """
+    for i, row in raw.head(20).iterrows():
+        row_str = ' '.join(str(v).lower() for v in row.values)
+        if any(kw.lower() in row_str for kw in keywords):
+            return i
+    return 0
+
+
+# ── public API ───────────────────────────────────────────────────────────────
+
+def parse_gstr2b(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    """
+    Auto-detect format from filename and parse GSTR-2B into standard DataFrame.
+    Supported: .json | .xlsx | .csv
+    """
+    ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+
+    if ext == 'json':
+        return _parse_gstr2b_json(file_bytes)
+    elif ext in ('xlsx', 'xls'):
+        return _parse_gstr2b_excel(file_bytes)
+    elif ext == 'csv':
+        return _parse_gstr2b_csv(file_bytes)
+    else:
+        # Fallback: try JSON first, then Excel
+        try:
+            return _parse_gstr2b_json(file_bytes)
+        except Exception:
+            try:
+                return _parse_gstr2b_excel(file_bytes)
+            except Exception:
+                return _parse_gstr2b_csv(file_bytes)
+
+
+def parse_tally(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    """
+    Auto-detect format from filename and parse Tally export into standard DataFrame.
+    Supported: .xlsx | .xls | .csv
+    """
+    ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+
+    if ext == 'xlsx':
+        return _parse_tally_excel(file_bytes, engine='openpyxl')
+    elif ext == 'xls':
+        return _parse_tally_excel(file_bytes, engine='xlrd')
+    elif ext == 'csv':
+        return _parse_tally_csv(file_bytes)
+    else:
+        # Fallback: try xlsx, then csv
+        try:
+            return _parse_tally_excel(file_bytes, engine='openpyxl')
+        except Exception:
+            return _parse_tally_csv(file_bytes)
