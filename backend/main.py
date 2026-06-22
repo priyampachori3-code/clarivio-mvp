@@ -18,6 +18,8 @@ from pydantic import BaseModel
 from rapidfuzz import fuzz
 from starlette.staticfiles import StaticFiles
 
+from parsers import parse_gstr2b, parse_tally
+
 SECRET_KEY = os.getenv('SECRET_KEY', 'clarivio-secret-change-in-production')
 ALGORITHM = 'HS256'
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 8
@@ -97,54 +99,6 @@ def amount(value) -> float:
         return float(value or 0)
     except (TypeError, ValueError):
         return 0.0
-
-def parse_gstr2b(file_bytes: bytes) -> pd.DataFrame:
-    data = json.loads(file_bytes)
-    b2b = data.get('data', {}).get('docdata', {}).get('b2b', data.get('b2b', []))
-    records = []
-    for supplier in b2b:
-        gstin = supplier.get('ctin', '')
-        for inv in supplier.get('inv', []):
-            item = (inv.get('itms') or [{}])[0].get('itm_det', {})
-            records.append({
-    'gstin': norm(gstin),
-    'invoice_no': norm(inv.get('inum', '')),
-    'invoice_date': inv.get('idt', ''),
-    'taxable_value': amount(inv.get('taxval', 0)),
-    # fix - read directly from invoice
-    'igst': amount(inv.get('igst') or item.get('iamt', 0)),
-    'cgst': amount(inv.get('cgst') or item.get('camt', 0)),
-    'sgst': amount(inv.get('sgst') or item.get('samt', 0)),
-})
-    return pd.DataFrame(records)
-
-def parse_tally_excel(file_bytes: bytes) -> pd.DataFrame:
-    df = pd.read_excel(io.BytesIO(file_bytes), engine='openpyxl')
-    df.columns = [str(c).strip().lower() for c in df.columns]
-    candidates = {
-        'gstin': ['gstin', 'party gstin', 'supplier gstin'],
-        'invoice_no': ['invoice no', 'invoice number', 'inv no', 'voucher no'],
-        'invoice_date': ['invoice date', 'inv date', 'date'],
-        'taxable_value': ['taxable value', 'taxable amount', 'basic amount'],
-        'igst': ['igst', 'igst amount'],
-        'cgst': ['cgst', 'cgst amount'],
-        'sgst': ['sgst', 'sgst amount'],
-    }
-    rename = {}
-    for target, names in candidates.items():
-        for name in names:
-            if name in df.columns:
-                rename[name] = target
-                break
-    df = df.rename(columns=rename)
-    for col in candidates:
-        if col not in df.columns:
-            df[col] = '' if col in {'gstin', 'invoice_no', 'invoice_date'} else 0
-    df['gstin'] = df['gstin'].apply(norm)
-    df['invoice_no'] = df['invoice_no'].apply(norm)
-    for col in ['taxable_value', 'igst', 'cgst', 'sgst']:
-        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-    return df[['gstin', 'invoice_no', 'invoice_date', 'taxable_value', 'igst', 'cgst', 'sgst']]
 
 def merged_row(portal, tally):
     return {
@@ -245,8 +199,10 @@ def generate_excel_report(result: dict) -> bytes:
 @app.post('/reconcile/run')
 async def run_reconciliation(gstr2b_file: UploadFile = File(...), tally_file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
     try:
-        portal_df = parse_gstr2b(await gstr2b_file.read())
-        tally_df = parse_tally_excel(await tally_file.read())
+        gstr2b_bytes = await gstr2b_file.read()
+tally_bytes = await tally_file.read()
+portal_df = parse_gstr2b(gstr2b_bytes, gstr2b_file.filename)
+tally_df = parse_tally(tally_bytes, tally_file.filename)
         return reconcile(portal_df, tally_df)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
