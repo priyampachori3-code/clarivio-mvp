@@ -107,14 +107,15 @@ def parse_gstr2b(file_bytes: bytes) -> pd.DataFrame:
         for inv in supplier.get('inv', []):
             item = (inv.get('itms') or [{}])[0].get('itm_det', {})
             records.append({
-                'gstin': norm(gstin),
-                'invoice_no': norm(inv.get('inum', '')),
-                'invoice_date': inv.get('idt', ''),
-                'taxable_value': amount(inv.get('val', 0)),
-                'igst': amount(item.get('iamt', 0)),
-                'cgst': amount(item.get('camt', 0)),
-                'sgst': amount(item.get('samt', 0)),
-            })
+    'gstin': norm(gstin),
+    'invoice_no': norm(inv.get('inum', '')),
+    'invoice_date': inv.get('idt', ''),
+    'taxable_value': amount(inv.get('taxval', 0)),
+    # fix - read directly from invoice
+    'igst': amount(inv.get('igst') or item.get('iamt', 0)),
+    'cgst': amount(inv.get('cgst') or item.get('camt', 0)),
+    'sgst': amount(inv.get('sgst') or item.get('samt', 0)),
+})
     return pd.DataFrame(records)
 
 def parse_tally_excel(file_bytes: bytes) -> pd.DataFrame:
